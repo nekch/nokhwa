@@ -59,12 +59,15 @@ impl MediaFoundationCaptureDevice {
 
         let availible = mf_device.compatible_format_list()?;
 
-        let desired = camera_fmt
-            .fulfill(&availible)
-            .ok_or(NokhwaError::InitializeError {
+        let Some(desired) = camera_fmt.fulfill(&availible) else {
+            return Err(NokhwaError::InitializeError {
                 backend: ApiBackend::MediaFoundation,
-                error: "Failed to fulfill requested format".to_string(),
-            })?;
+                error: format!(
+                    "Failed to fulfill requested format (native: {})",
+                    mf_device.native_format_summary()
+                ),
+            });
+        };
 
         mf_device.set_format(desired)?;
 

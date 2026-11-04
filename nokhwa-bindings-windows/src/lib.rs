@@ -27,8 +27,54 @@
 //!
 //! No support or API stability will be given. Subject to change at any time.
 
+/// Converts an `MFRatio` packed in a `u64` (numerator in the high 32 bits, denominator in the low
+/// 32 bits) to whole frames per second, rounded to nearest; 0 when the denominator is 0.
+///
+/// Devices, notably virtual and DirectShow-bridged cameras, report rates such as `10000000/333333`
+/// or `30000/1001` instead of `30/1`. Treating every ratio with a denominator other than 1 as
+/// unsupported left such devices with no usable format at all ("Failed to fulfill requested format").
+#[cfg_attr(any(not(windows), feature = "docs-only"), allow(dead_code))]
+fn mf_ratio_to_fps(fraction_u64: u64) -> u32 {
+    let numerator = fraction_u64 >> 32;
+    let denominator = fraction_u64 & 0xFFFF_FFFF;
+    if denominator == 0 {
+        return 0;
+    }
+    ((numerator + denominator / 2) / denominator) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mf_ratio_to_fps;
+
+    fn ratio(numerator: u32, denominator: u32) -> u64 {
+        (u64::from(numerator) << 32) | u64::from(denominator)
+    }
+
+    #[test]
+    fn whole_rates_are_unchanged() {
+        assert_eq!(30, mf_ratio_to_fps(ratio(30, 1)));
+        assert_eq!(60, mf_ratio_to_fps(ratio(60, 1)));
+    }
+
+    #[test]
+    fn fractional_rates_round_to_nearest() {
+        assert_eq!(30, mf_ratio_to_fps(ratio(10_000_000, 333_333)));
+        assert_eq!(30, mf_ratio_to_fps(ratio(30_000, 1001)));
+        assert_eq!(24, mf_ratio_to_fps(ratio(24_000, 1001)));
+        assert_eq!(60, mf_ratio_to_fps(ratio(60_000, 1001)));
+        assert_eq!(15, mf_ratio_to_fps(ratio(10_000_000, 666_667)));
+    }
+
+    #[test]
+    fn zero_denominator_is_no_rate() {
+        assert_eq!(0, mf_ratio_to_fps(ratio(30, 0)));
+    }
+}
+
 #[cfg(all(windows, not(feature = "docs-only")))]
 pub mod wmf {
+    use super::mf_ratio_to_fps;
     use nokhwa_core::error::NokhwaError;
     use nokhwa_core::types::{
         ApiBackend, CameraControl, CameraFormat, CameraIndex, CameraInfo, ControlValueDescription,
@@ -65,9 +111,9 @@ pub mod wmf {
                 },
                 KernelStreaming::GUID_NULL,
                 MediaFoundation::{
-                    IMFActivate, IMFAttributes, IMFMediaSource, IMFSample, IMFSourceReader,
-                    MFCreateAttributes, MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources,
-                    MFShutdown, MFStartup, MFSTARTUP_NOSOCKET, MF_API_VERSION,
+                    IMFActivate, IMFAttributes, IMFMediaSource, IMFMediaType, IMFSample,
+                    IMFSourceReader, MFCreateAttributes, MFCreateSourceReaderFromMediaSource,
+                    MFEnumDeviceSources, MFShutdown, MFStartup, MFSTARTUP_NOSOCKET, MF_API_VERSION,
                     MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
                     MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
                     MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_MT_FRAME_RATE,
@@ -161,6 +207,41 @@ pub mod wmf {
     //         )*
     //     };
     // }
+
+    /// The distinct non-zero frame rates a native media type advertises (max, nominal, min), rounded
+    /// to whole fps.
+    fn media_type_frame_rates(media_type: &IMFMediaType) -> Vec<u32> {
+        let mut framerates = vec![];
+        for attribute in [
+            &MF_MT_FRAME_RATE_RANGE_MAX,
+            &MF_MT_FRAME_RATE,
+            &MF_MT_FRAME_RATE_RANGE_MIN,
+        ] {
+            if let Ok(fraction_u64) = unsafe { media_type.GetUINT64(attribute) } {
+                let fps = mf_ratio_to_fps(fraction_u64);
+                if fps != 0 && !framerates.contains(&fps) {
+                    framerates.push(fps);
+                }
+            }
+        }
+        framerates
+    }
+
+    /// Readable name of a video subtype GUID: the four-character code for FOURCC-based subtypes
+    /// (`NV12`, `YUY2`, `MJPG`), the D3DFORMAT number for the RGB ones (`RGB24` is 20, `RGB32` is
+    /// 22), else the GUID.
+    fn subtype_name(guid: GUID) -> String {
+        const BASE_DATA4: [u8; 8] = [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71];
+        if guid.data2 != 0 || guid.data3 != 0x0010 || guid.data4 != BASE_DATA4 {
+            return format!("{guid:?}");
+        }
+        let bytes = guid.data1.to_le_bytes();
+        if bytes.iter().all(u8::is_ascii_graphic) {
+            String::from_utf8_lossy(&bytes).into_owned()
+        } else {
+            format!("D3DFMT {}", guid.data1)
+        }
+    }
 
     fn guid_to_frameformat(guid: GUID) -> Option<FrameFormat> {
         match guid {
@@ -592,39 +673,7 @@ pub mod wmf {
                     }
                 };
 
-                // MFRatio is represented as 2 u32s in memory. This means we can convert it to 2
-                let framerate_list = {
-                    let mut framerates = vec![0_u32; 3];
-                    if let Ok(fraction_u64) =
-                        unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE_RANGE_MAX) }
-                    {
-                        let mut numerator = (fraction_u64 >> 32) as u32;
-                        let denominator = fraction_u64 as u32;
-                        if denominator != 1 {
-                            numerator = 0;
-                        }
-                        framerates.push(numerator);
-                    };
-                    if let Ok(fraction_u64) = unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE) } {
-                        let mut numerator = (fraction_u64 >> 32) as u32;
-                        let denominator = fraction_u64 as u32;
-                        if denominator != 1 {
-                            numerator = 0;
-                        }
-                        framerates.push(numerator);
-                    };
-                    if let Ok(fraction_u64) =
-                        unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE_RANGE_MIN) }
-                    {
-                        let mut numerator = (fraction_u64 >> 32) as u32;
-                        let denominator = fraction_u64 as u32;
-                        if denominator != 1 {
-                            numerator = 0;
-                        }
-                        framerates.push(numerator);
-                    };
-                    framerates
-                };
+                let framerate_list = media_type_frame_rates(&media_type);
 
                 let frame_fmt = match guid_to_frameformat(fourcc) {
                     Some(fcc) => fcc,
@@ -642,6 +691,38 @@ pub mod wmf {
                 }
             }
             Ok(camera_format_list)
+        }
+
+        /// Every native media type the device offers, as Media Foundation reports it before any
+        /// filtering: subtype, size and raw frame-rate ratio. Goes into the "Failed to fulfill
+        /// requested format" error so a field log shows why nothing matched.
+        pub fn native_format_summary(&mut self) -> String {
+            const MAX_LISTED: usize = 16;
+            let mut entries = vec![];
+            let mut count = 0_usize;
+            while let Ok(media_type) = unsafe {
+                self.source_reader
+                    .GetNativeMediaType(MEDIA_FOUNDATION_FIRST_VIDEO_STREAM, count as u32)
+            } {
+                count += 1;
+                if entries.len() == MAX_LISTED {
+                    continue;
+                }
+                let subtype = unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) }
+                    .map_or_else(|_| "?".to_string(), subtype_name);
+                let size = unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }
+                    .map_or_else(|_| "?".to_string(), |s| format!("{}x{}", s >> 32, s as u32));
+                let rate = unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE) }
+                    .map_or_else(|_| "?".to_string(), |r| format!("{}/{}", r >> 32, r as u32));
+                entries.push(format!("{subtype} {size} @ {rate}"));
+            }
+            if count == 0 {
+                return "no native media types".to_string();
+            }
+            if count > entries.len() {
+                entries.push(format!("... {count} in total"));
+            }
+            entries.join(", ")
         }
 
         pub fn control(&self, control: KnownCameraControl) -> Result<CameraControl, NokhwaError> {
@@ -950,7 +1031,7 @@ pub mod wmf {
                     };
 
                     let frame_rate = match unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE) } {
-                        Ok(fps) => fps as u32,
+                        Ok(fps) => mf_ratio_to_fps(fps),
                         Err(why) => {
                             return Err(NokhwaError::GetPropertyError {
                                 property: "MF_MT_FRAME_RATE".to_string(),
@@ -1047,39 +1128,7 @@ pub mod wmf {
                     continue;
                 }
 
-                // MFRatio is represented as 2 u32s in memory. This means we can convert it to 2
-                let framerate_list = {
-                    let mut framerates = vec![0_u32; 3];
-                    if let Ok(fraction_u64) =
-                        unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE_RANGE_MAX) }
-                    {
-                        let mut numerator = (fraction_u64 >> 32) as u32;
-                        let denominator = fraction_u64 as u32;
-                        if denominator != 1 {
-                            numerator = 0;
-                        }
-                        framerates.push(numerator);
-                    };
-                    if let Ok(fraction_u64) = unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE) } {
-                        let mut numerator = (fraction_u64 >> 32) as u32;
-                        let denominator = fraction_u64 as u32;
-                        if denominator != 1 {
-                            numerator = 0;
-                        }
-                        framerates.push(numerator);
-                    };
-                    if let Ok(fraction_u64) =
-                        unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE_RANGE_MIN) }
-                    {
-                        let mut numerator = (fraction_u64 >> 32) as u32;
-                        let denominator = fraction_u64 as u32;
-                        if denominator != 1 {
-                            numerator = 0;
-                        }
-                        framerates.push(numerator);
-                    };
-                    framerates
-                };
+                let framerate_list = media_type_frame_rates(&media_type);
 
                 for frame_rate in framerate_list {
                     if frame_rate == format.frame_rate() {
@@ -1309,6 +1358,10 @@ pub mod wmf {
             Err(NokhwaError::NotImplementedError(
                 "Only on Windows".to_string(),
             ))
+        }
+
+        pub fn native_format_summary(&mut self) -> String {
+            String::new()
         }
 
         pub fn control(&self, _control: KnownCameraControl) -> Result<CameraControl, NokhwaError> {
