@@ -28,11 +28,8 @@
 //! No support or API stability will be given. Subject to change at any time.
 
 /// Converts an `MFRatio` packed in a `u64` (numerator in the high 32 bits, denominator in the low
-/// 32 bits) to whole frames per second, rounded to nearest; 0 when the denominator is 0.
-///
-/// Devices, notably virtual and DirectShow-bridged cameras, report rates such as `10000000/333333`
-/// or `30000/1001` instead of `30/1`. Treating every ratio with a denominator other than 1 as
-/// unsupported left such devices with no usable format at all ("Failed to fulfill requested format").
+/// 32 bits) to whole frames per second, rounded to nearest; 0 when the denominator is 0. Virtual
+/// cameras report e.g. `10000000/333333` rather than `30/1`.
 #[cfg_attr(any(not(windows), feature = "docs-only"), allow(dead_code))]
 fn mf_ratio_to_fps(fraction_u64: u64) -> u32 {
     let numerator = fraction_u64 >> 32;
@@ -208,8 +205,6 @@ pub mod wmf {
     //     };
     // }
 
-    /// The distinct non-zero frame rates a native media type advertises (max, nominal, min), rounded
-    /// to whole fps.
     fn media_type_frame_rates(media_type: &IMFMediaType) -> Vec<u32> {
         let mut framerates = vec![];
         for attribute in [
@@ -227,9 +222,8 @@ pub mod wmf {
         framerates
     }
 
-    /// Readable name of a video subtype GUID: the four-character code for FOURCC-based subtypes
-    /// (`NV12`, `YUY2`, `MJPG`), the D3DFORMAT number for the RGB ones (`RGB24` is 20, `RGB32` is
-    /// 22), else the GUID.
+    /// FOURCC-based subtypes carry their code in `data1` (`NV12`, `YUY2`, `MJPG`); RGB ones carry a
+    /// D3DFORMAT number there (`RGB24` is 20, `RGB32` is 22).
     fn subtype_name(guid: GUID) -> String {
         const BASE_DATA4: [u8; 8] = [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71];
         if guid.data2 != 0 || guid.data3 != 0x0010 || guid.data4 != BASE_DATA4 {
@@ -693,9 +687,7 @@ pub mod wmf {
             Ok(camera_format_list)
         }
 
-        /// Every native media type the device offers, as Media Foundation reports it before any
-        /// filtering: subtype, size and raw frame-rate ratio. Goes into the "Failed to fulfill
-        /// requested format" error so a field log shows why nothing matched.
+        /// Native media types before any filtering, with the raw frame-rate ratio.
         pub fn native_format_summary(&mut self) -> String {
             const MAX_LISTED: usize = 16;
             let mut entries = vec![];
